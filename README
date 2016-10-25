@@ -1,1 +1,101 @@
 spring boot + atomikos + jpa + mysql
+
+
+
+
+http://cache.baiducontent.com/c?m=9f65cb4a8c8507ed4fece7631046893b4c4380146d96864968d4e414c422460b1c31bbf123211a1980853a3c50f11e41bca770216c5d61aa9ccb8a4bd6bf94283bcd7a742613ce06558d0eafba07729d61cb1cb2eb4ef0bb802593d8c5d2af0e049905523ac1&p=853bcd15d9c342ae34bfc7710f0e91&newp=8b2a9715d9c342ae11b7c139555f9c231610db2151d1d101298ffe0cc4241a1a1a3aecbf26241002d4c279660baa4d5feaf33270350034f1f689df08d2ecce7e&user=baidu&fm=sc&query=zuul+sensitive-headers&qid=c4ed939800002a52&p1=3
+
+
+
+参考:https://github.com/spring-guides/tut-spring-security-and-angular-js/blob/master/proxy/README.adoc 
+和前文相似,使用SpringSession实现HttpSession共享,UI服务器同时是反向代理服务器,根据需求将请求转发到资源服务器,这里同时将请求头转发,资源服务器从请求头得到Token,进行Token解码,得到认证授权信息.这种思路省去了跨域问题.主要原理看下图: 
+ 
+1.浏览器向UI服务器进行认证授权 
+2.将认证授权信息存储在Redis服务器 
+3.浏览器向UI服务器发出请求 
+4.UI服务器将请求转发到资源服务器 
+5.Resource服务器从请求头得到Token,向Redis服务器获取认证授权信息 
+最后返回资源到UI服务器，再返回资源给浏览器.
+
+使用spring要创建一个反向代理是件简单的事情. 
+1.加入pom.xml
+
+ <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.springframework.cloud</groupId>
+                <artifactId>spring-cloud-dependencies</artifactId>
+                <version>Angel.SR6</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-zuul</artifactId>
+        </dependency>
+    <dependencies>
+2.在application.yml配置路由映射信息
+
+zuul:
+  routes:
+    resource:
+      path: /resource/**
+      url: http://localhost:9000
+3.在主应用类加入注解@EnableZuulProxy,启动就可以测试了.这种思路可以解决上节的跨域问题.
+
+上面是不需要权限控制的代理服务器配置,如果要进行权限控制,还要往下走: 
+1.在在UI服务器和Resource服务器都配置spring session. 
+2.在UI服务器加入以下配置,意思是转发时,同时转发请求头,
+
+zuul:
+  routes:
+    resource:
+      sensitive-headers:
+3.在Resource服务器加入安全控制,禁止弹出认证对话框.@SpringBootApplication
+
+public class ResourceApplication extends WebSecurityConfigurerAdapter {
+
+    @Override
+    protected void configure(HttpSecurity http) throws Exception {
+        http.httpBasic().disable();
+        http.authorizeRequests().anyRequest().authenticated();
+    }
+
+}
+同时,资源服务器没必要创建session,在application.properties加入 
+security.sessions: NEVER
+
+security session创建策略详解: 
+如果使用了spring boot,spring boot自带一套HttpSecurity配置:
+
+@Autowired
+private SecurityProperties security;
+org.springframework.boot.autoconfigure.security.SpringBootWebSecurityConfiguration.ApplicationWebSecurityConfigurerAdapter#configure{
+http.sessionManagement().sessionCreationPolicy(this.security.getSessions());
+}
+spring boot自带的这套HttpSecurity配置,很明显它从SecurityProperties里去取,如果没有在application.properties配置,那么它的默认值就是STATELESS,security不会去创建session.如果在application.properties配置了值,当然是配置的值. 
+如果我们有需求要覆盖这套HttpSecurity配置(一般都要覆盖),覆盖的原理参考
+
+org.springframework.security.web.FilterChainProxy#getFilters(javax.servlet.http.HttpServletRequest){
+    for (SecurityFilterChain chain : filterChains) {
+        if (chain.matches(request)) {
+            return chain.getFilters();
+        }
+    }
+    return null;
+}
+主要看filterChains,如果配了两套HttpSecurity,filterChains至少会各自对应一个SecurityFilterChain(可能配置忽略Url,就会再多几个SecurityFilterChain),上面的方法是如果匹配,就直接从SecurityFilterChain拿到里面的Filters返回.这段代码会先涉及到:1是否匹配,只有匹配才会从里面取Filter;2.谁先匹配,就先从它那里取Filter.知道这两点,spring boot自带的那套HttpSecurity产生的SecurityFilterChain没有做路径排除,就会匹配所有路径,要想从其它的HttpSecurity产生的SecurityFilterChain拿Filter,就要让这个SecurityFilterChain装在filterChains的前面. 
+解决方法:因为spring boot自带的org.springframework.boot.autoconfigure.security.SpringBootWebSecurityConfiguration.ApplicationWebSecurityConfigurerAdapter上有@Order(SecurityProperties.BASIC_AUTH_ORDER),那么我们自定义的WebSecurityConfigurerAdapter的order比它小就可以了,比如使用@Order(SecurityProperties.BASIC_AUTH_ORDER-1)或使用@Order(SecurityProperties.ACCESS_OVERRIDE_ORDER)也好.
+
+@Override
+public void configure(HttpSecurity http) throws Exception {
+
+}
+重写的这个方法,如果没有使用http.sessionManagement().sessionCreationPolicy(this.security.getSessions());,那么application.properties配置什么值都没用,因为它不会自动用上,它的默认值就是org.springframework.security.config.annotation.web.configurers.SessionManagementConfigurer#sessionPolicy的默认值SessionCreationPolicy.IF_REQUIRED; 
+对于security session的几个值的详细意义就参考org.springframework.security.config.http.SessionCreationPolicy的API文档. 
+了解这些,对于有时你想创建session的情况,你却设置了不创建session,可能你就无法登录.对于使用了oauth,客户端解token,就无必要创建session.后面使用jwt,也没必要创建session.因为可以使用jwt的无状态认证机制,服务端可以不创建session认证信息.
+
